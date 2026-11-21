@@ -3,13 +3,16 @@
 One adapter exposes a uniform API regardless of ``sandbox`` vs ``prod`` mode; it
 dispatches each call to the right service namespace (``client.sandbox.*`` for
 sandbox accounts/portfolio/orders, ``client.operations/orders/users.*`` for
-prod) and uses the right gRPC endpoint. A fresh sync ``Client`` is opened per
-call (matches the other MCP servers in this repo). Tokens are read from
-:class:`Settings` and never logged.
+prod) and uses the right gRPC endpoint. One sync ``Client`` per
+(token, endpoint) is kept for the process lifetime: gRPC channels are
+thread-safe and reconnect with backoff, while opening a new channel per call
+proved unreliable in production (T-Invest drops part of new TCP connections).
+Tokens are read from :class:`Settings` and never logged.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -61,6 +64,12 @@ _FIND_KIND = {
     "currency": InstrumentType.INSTRUMENT_TYPE_CURRENCY,
 }
 
+# Long-lived clients, keyed by (token, target). gRPC multiplexes calls over one
+# HTTP/2 connection and reconnects on its own; creating a channel per call made
+# every tool invocation depend on a fresh TCP+TLS handshake.
+_CLIENTS: dict[tuple[str, str], object] = {}
+_CLIENTS_LOCK = threading.Lock()
+
 
 def to_quotation(value: Decimal) -> Quotation:
     units, nano = decimal_to_quotation_parts(value)
@@ -90,8 +99,15 @@ class TInvestAdapter:
                 f"No {which} token configured for mode '{self.settings.mode}'. "
                 "Set the appropriate TINVEST_*_TOKEN environment variable."
             )
-        with Client(token, target=self._target) as client:
-            yield client
+        key = (token, self._target)
+        client = _CLIENTS.get(key)
+        if client is None:
+            with _CLIENTS_LOCK:
+                client = _CLIENTS.get(key)
+                if client is None:
+                    client = Client(token, target=self._target).__enter__()
+                    _CLIENTS[key] = client
+        yield client
 
     # -- accounts ----------------------------------------------------------------
     def get_accounts(self) -> list:

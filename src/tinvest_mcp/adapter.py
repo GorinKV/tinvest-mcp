@@ -43,6 +43,7 @@ from .sdk import (
     OrderType,
     Page,
     Quotation,
+    RequestError,
 )
 from .tls import ensure_grpc_roots
 
@@ -81,6 +82,51 @@ def to_money(value: Decimal, currency: str = "rub") -> MoneyValue:
     return MoneyValue(currency=currency, units=units, nano=nano)
 
 
+
+# -- stability: retry transient gRPC failures -------------------------------
+
+import functools
+import time
+
+import grpc
+
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.5
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for gRPC UNAVAILABLE/DEADLINE_EXCEEDED (T-Invest drops connections)."""
+    if not isinstance(exc, RequestError):
+        return False
+    code = getattr(exc, "code", None)
+    return code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+
+
+def _stable(fn):
+    """Retry a sync adapter call on transient gRPC errors; drop cached channels.
+
+    T-Invest's edge periodically resets TCP connections ("tcp handshaker
+    shutdown"): the retry + fresh-channel reset makes the MCP server stable.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        last_exc: Exception | None = None
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - transient only
+                if not _is_transient(exc):
+                    raise
+                last_exc = exc
+                with _CLIENTS_LOCK:
+                    _CLIENTS.clear()
+                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
+
+    return wrapper
+
+
 class TInvestAdapter:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -110,12 +156,14 @@ class TInvestAdapter:
         yield client
 
     # -- accounts ----------------------------------------------------------------
+    @_stable
     def get_accounts(self) -> list:
         with self._client() as client:
             if self.settings.is_sandbox:
                 return list(client.sandbox.get_sandbox_accounts().accounts)
             return list(client.users.get_accounts().accounts)
 
+    @_stable
     def get_trade_accounts(self) -> list:
         """List accounts through the execution token without performing a mutation.
 
@@ -129,18 +177,21 @@ class TInvestAdapter:
             return list(client.users.get_accounts().accounts)
 
     # -- portfolio / positions ---------------------------------------------------
+    @_stable
     def get_portfolio(self, account_id: str):
         with self._client() as client:
             if self.settings.is_sandbox:
                 return client.sandbox.get_sandbox_portfolio(account_id=account_id)
             return client.operations.get_portfolio(account_id=account_id)
 
+    @_stable
     def get_positions(self, account_id: str):
         with self._client() as client:
             if self.settings.is_sandbox:
                 return client.sandbox.get_sandbox_positions(account_id=account_id)
             return client.operations.get_positions(account_id=account_id)
 
+    @_stable
     def get_operations_by_cursor(
         self,
         account_id: str,
@@ -176,6 +227,7 @@ class TInvestAdapter:
             return client.operations.get_operations_by_cursor(request=request)
 
     # -- instruments (work on both endpoints) ------------------------------------
+    @_stable
     def find_instrument(
         self,
         query: str,
@@ -192,6 +244,7 @@ class TInvestAdapter:
             )
             return list(resp.instruments)
 
+    @_stable
     def list_instruments(self, instrument_type: str) -> list:
         """Return the FULL tradeable catalogue for a type (share|bond|etf)."""
         kind = (instrument_type or "").lower()
@@ -210,6 +263,7 @@ class TInvestAdapter:
                 )
             raise TInvestConfigurationError(f"Unsupported instrument_type for listing: {instrument_type!r}")
 
+    @_stable
     def list_currencies(self) -> list:
         """FX instruments (CNYRUB_TOM & co) — the source of ruble conversion rates."""
         with self._client() as client:
@@ -318,11 +372,13 @@ class TInvestAdapter:
             return client.instruments.get_asset_by(id=asset_uid)
 
     # -- market data -------------------------------------------------------------
+    @_stable
     def get_last_price(self, uid: str):
         with self._client() as client:
             prices = client.market_data.get_last_prices(instrument_id=[uid]).last_prices
             return prices[0] if prices else None
 
+    @_stable
     def get_last_prices(self, uids: list[str]) -> list:
         """Batch last-price lookup (one call for many instruments)."""
         uids = [u for u in uids if u]
@@ -331,15 +387,18 @@ class TInvestAdapter:
         with self._client() as client:
             return list(client.market_data.get_last_prices(instrument_id=uids).last_prices)
 
+    @_stable
     def get_order_book(self, uid: str, depth: int = 10):
         with self._client() as client:
             return client.market_data.get_order_book(instrument_id=uid, depth=depth)
 
+    @_stable
     def get_trading_status(self, uid: str):
         with self._client() as client:
             return client.market_data.get_trading_status(instrument_id=uid)
 
     # -- order pricing -----------------------------------------------------------
+    @_stable
     def get_order_price(self, account_id: str, uid: str, price: Decimal, direction: str, quantity: int):
         request = GetOrderPriceRequest(
             account_id=account_id,
@@ -353,6 +412,7 @@ class TInvestAdapter:
                 return client.sandbox.get_sandbox_order_price(request=request)
             return client.orders.get_order_price(request=request)
 
+    @_stable
     def get_max_lots(self, account_id: str, uid: str, price: Decimal):
         request = GetMaxLotsRequest(account_id=account_id, instrument_id=uid, price=to_quotation(price))
         with self._client() as client:
@@ -361,6 +421,7 @@ class TInvestAdapter:
             return client.orders.get_max_lots(request=request)
 
     # -- order execution ---------------------------------------------------------
+    @_stable
     def post_order(
         self,
         *,
@@ -386,12 +447,14 @@ class TInvestAdapter:
                 return client.sandbox.post_sandbox_order(**kwargs)
             return client.orders.post_order(**kwargs)
 
+    @_stable
     def get_order_state(self, account_id: str, order_id: str):
         with self._client(trade=True) as client:
             if self.settings.is_sandbox:
                 return client.sandbox.get_sandbox_order_state(account_id=account_id, order_id=order_id)
             return client.orders.get_order_state(account_id=account_id, order_id=order_id)
 
+    @_stable
     def cancel_order(self, account_id: str, order_id: str):
         with self._client(trade=True) as client:
             if self.settings.is_sandbox:
